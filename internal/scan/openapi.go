@@ -30,8 +30,7 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 	findings = append(findings, headBase(client, sp.Server, hdrs)...)
 
 	type job struct {
-		p  string
-		op *openapi3.Operation
+		op openapi.Operation
 	}
 	var jobs chan job = make(chan job)
 	var wg sync.WaitGroup
@@ -39,28 +38,24 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 
 	worker := func() {
 		defer wg.Done()
-
 		for j := range jobs {
-			fs := checkGET(ctx, client, sp.Server, j.p, j.op, hdrs)
+			// j.op.Path is the path string; j.op.Raw is *openapi3.Operation
+			fs := checkGET(ctx, client, sp.Server, j.op.Path, j.op.Raw, hdrs)
 			mu.Lock()
 			findings = append(findings, fs...)
 			mu.Unlock()
 		}
 	}
 
-	// CONTINUE FROM HERE
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go worker()
 	}
 
-	for pth, item := range sp.Doc.Paths.Map() {
-		if item == nil {
-			continue
-		}
-
-		if item.Get != nil {
-			jobs <- job{p: pth, op: item.Get}
+	ops := sp.Operations()
+	for _, o := range ops {
+		if o.Method == http.MethodGet { // keep GET-only for now
+			jobs <- job{op: o}
 		}
 	}
 
@@ -347,7 +342,7 @@ func checkCORSandHeaders(client *http.Client, base string, hdr http.Header) []re
 	if resp, err := client.Do(req); err == nil {
 		acao := resp.Header.Get("Access-Control-Allow-Origin")
 		acc := strings.ToLower(resp.Header.Get("Access-Control-Allow-Credentials"))
-		if acao == "*" && "acc" == "true" {
+		if acao == "*" && acc == "true" {
 			out = append(out, report.Finding{
 				ID: "A-020", Severity: "high", Category: "cors",
 				Evidence: map[string]interface{}{"allow-origin": acao, "allow-credentials": acc},
