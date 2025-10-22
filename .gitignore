@@ -1,0 +1,67 @@
+# ──────────────────────────────
+# Go build & cache
+# ──────────────────────────────
+bin/
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go module / cache files
+go.work
+go.work.sum
+*.local
+
+# Dependency caches
+vendor/
+**/.cache/
+**/.idea/
+**/.vscode/
+
+# ──────────────────────────────
+# OS / Editor junk
+# ──────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*.log
+
+# ──────────────────────────────
+# Test & temporary outputs
+# ──────────────────────────────
+coverage.out
+*.tmp
+*.bak
+*.old
+*.orig
+*.rej
+
+# ──────────────────────────────
+# Reports & scan outputs
+# (Aegis CLI generates these)
+# ──────────────────────────────
+report.json
+report.md
+*.scan.json
+*.scan.md
+
+# ──────────────────────────────
+# Examples / specs generated locally
+# ──────────────────────────────
+examples/*.yaml
+examples/httpbin.yaml
+examples/petstore.yaml  # keep a couple of demo specs
+
+# ──────────────────────────────
+# Build artifacts from commands
+# ──────────────────────────────
+/kashef
+/kashef.exe
+cmd/kashef/kashef
