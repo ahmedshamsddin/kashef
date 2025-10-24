@@ -9,14 +9,16 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
+	brokenauth "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api2_broken_auth"
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duration, concurrency int, failOn string) (int, error) {
+func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duration, concurrency int, failOn string, verbose bool) (int, error) {
 	ctx := context.Background()
 	sp, err := openapi.Load(ctx, specPath)
 
@@ -32,6 +34,16 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 	type job struct {
 		op openapi.Operation
 	}
+
+	testedSecuredGET := int32(0)
+	flaggedNoToken := int32(0)
+
+	detCtx := brokenauth.Context{
+		BaseURL: sp.Server,
+		Client:  client,
+		Headers: hdrs,
+	}
+
 	var jobs chan job = make(chan job)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -41,8 +53,22 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 		for j := range jobs {
 			// j.op.Path is the path string; j.op.Raw is *openapi3.Operation
 			fs := checkGET(ctx, client, sp.Server, j.op.Path, j.op.Raw, hdrs)
+			if j.op.RequiresAuth && strings.ToUpper(j.op.Method) == http.MethodGet {
+				atomic.AddInt32(&testedSecuredGET, 1)
+				if verbose {
+					fmt.Printf("[no-token] testing %s %s\n", j.op.Method, j.op.Path)
+				}
+			}
+			fs2 := brokenauth.DetectNoToken(ctx, detCtx, j.op)
+			if len(fs2) > 0 {
+				atomic.AddInt32(&flaggedNoToken, int32(len(fs2)))
+				if verbose {
+					fmt.Printf("[no-token] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fs2))
+				}
+			}
 			mu.Lock()
 			findings = append(findings, fs...)
+			findings = append(findings, fs2...)
 			mu.Unlock()
 		}
 	}
@@ -54,14 +80,16 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 
 	ops := sp.Operations()
 	for _, o := range ops {
-		if o.Method == http.MethodGet { // keep GET-only for now
+		if strings.ToUpper(o.Method) == http.MethodGet {
 			jobs <- job{op: o}
 		}
 	}
 
 	close(jobs)
 	wg.Wait()
-
+	if verbose {
+		fmt.Printf("BrokenAuth(no-token): tested=%d flagged=%d\n", testedSecuredGET, flaggedNoToken)
+	}
 	findings = append(findings, checkCORSandHeaders(client, sp.Server, hdrs)...)
 
 	rep := report.Report{Scanner: "kashef", Target: sp.Server, Findings: findings}

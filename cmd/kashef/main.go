@@ -15,6 +15,7 @@ var (
 	timeout     time.Duration
 	headers     []string
 	failOn      string
+	verbose     bool
 )
 
 func main() {
@@ -29,7 +30,7 @@ func main() {
 		Short: "Scan using an OpenAPI spec (read-only)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			code, err := scan.RunOpenAPIScan(args[0], out, headers, timeout, concurrency, failOn)
+			code, err := scan.RunOpenAPIScan(args[0], out, headers, timeout, concurrency, failOn, verbose)
 			if err != nil {
 				return err
 			}
@@ -42,6 +43,7 @@ func main() {
 	openapiCmd.Flags().StringVarP(&out, "out", "o", "report.json", "Output (json|md by extension)")
 	openapiCmd.Flags().IntVarP(&concurrency, "concurrency", "c", 12, "Concurrent requests")
 	openapiCmd.Flags().StringVar(&failOn, "fail-on", "medium", "Fail CI on >= severity (none|low|medium|high)")
+	openapiCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Print debug scan info")
 
 	scanCmd.AddCommand(openapiCmd)
 	root.AddCommand(scanCmd)
