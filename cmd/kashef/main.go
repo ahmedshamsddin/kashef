@@ -16,6 +16,7 @@ var (
 	headers     []string
 	failOn      string
 	verbose     bool
+	allowWrite  bool
 )
 
 func main() {
@@ -30,7 +31,7 @@ func main() {
 		Short: "Scan using an OpenAPI spec (read-only)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			code, err := scan.RunOpenAPIScan(args[0], out, headers, timeout, concurrency, failOn, verbose)
+			code, err := scan.RunOpenAPIScan(args[0], out, headers, timeout, concurrency, failOn, verbose, allowWrite)
 			if err != nil {
 				return err
 			}
@@ -44,6 +45,7 @@ func main() {
 	openapiCmd.Flags().IntVarP(&concurrency, "concurrency", "c", 12, "Concurrent requests")
 	openapiCmd.Flags().StringVar(&failOn, "fail-on", "medium", "Fail CI on >= severity (none|low|medium|high)")
 	openapiCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Print debug scan info")
+	openapiCmd.Flags().BoolVar(&allowWrite, "allow-write", false, "Allow POST/PUT/PATCH/DELETE probes (use only on staging)")
 
 	scanCmd.AddCommand(openapiCmd)
 	root.AddCommand(scanCmd)

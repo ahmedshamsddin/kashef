@@ -15,85 +15,110 @@ import (
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 	brokenauth "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api2_broken_auth"
+	securitymisconfig "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api8_security_misconfig"
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duration, concurrency int, failOn string, verbose bool) (int, error) {
+func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duration, concurrency int, failOn string, verbose bool, allowWrite bool) (int, error) {
 	ctx := context.Background()
 	sp, err := openapi.Load(ctx, specPath)
-
 	if err != nil {
 		return 2, err
 	}
 
-	var client *http.Client = &http.Client{Timeout: timeout}
+	client := &http.Client{Timeout: timeout}
 	hdrs := parseHeaders(headers)
-	var findings []report.Finding = []report.Finding{}
+
+	var findings []report.Finding
 	findings = append(findings, headBase(client, sp.Server, hdrs)...)
 
 	type job struct {
 		op openapi.Operation
 	}
 
-	testedSecuredGET := int32(0)
-	flaggedNoToken := int32(0)
+	// Debug counters
+	var testedSecured int32
+	var flaggedNoToken int32
 
 	detCtx := brokenauth.Context{
-		BaseURL: sp.Server,
-		Client:  client,
-		Headers: hdrs,
+		BaseURL:    sp.Server,
+		Client:     client,
+		Headers:    hdrs,
+		AllowWrite: allowWrite,
+		Verbose:    verbose,
 	}
 
-	var jobs chan job = make(chan job)
+	jobs := make(chan job)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
 	worker := func() {
 		defer wg.Done()
 		for j := range jobs {
-			// j.op.Path is the path string; j.op.Raw is *openapi3.Operation
-			fs := checkGET(ctx, client, sp.Server, j.op.Path, j.op.Raw, hdrs)
-			if j.op.RequiresAuth && strings.ToUpper(j.op.Method) == http.MethodGet {
-				atomic.AddInt32(&testedSecuredGET, 1)
+			// 1) Broken Auth (no-token) for ANY secured op (GET/POST/PUT/PATCH/DELETE)
+			if j.op.RequiresAuth {
+				atomic.AddInt32(&testedSecured, 1)
 				if verbose {
-					fmt.Printf("[no-token] testing %s %s\n", j.op.Method, j.op.Path)
+					fmt.Printf("[no-token] testing %s %s\n", strings.ToUpper(j.op.Method), j.op.Path)
 				}
 			}
-			fs2 := brokenauth.DetectNoToken(ctx, detCtx, j.op)
-			if len(fs2) > 0 {
-				atomic.AddInt32(&flaggedNoToken, int32(len(fs2)))
+			fsNoTok := brokenauth.DetectNoToken(ctx, detCtx, j.op)
+			if len(fsNoTok) > 0 {
+				atomic.AddInt32(&flaggedNoToken, int32(len(fsNoTok)))
 				if verbose {
-					fmt.Printf("[no-token] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fs2))
+					fmt.Printf("[no-token] FLAGGED %s %s -> %d finding(s)\n",
+						strings.ToUpper(j.op.Method), j.op.Path, len(fsNoTok))
 				}
 			}
+			fsJWT := brokenauth.DetectJWTAlgNone(ctx, detCtx, j.op)
+			if len(fsJWT) > 0 {
+				atomic.AddInt32(&flaggedNoToken, int32(len(fsJWT))) // you can keep using same counter or make separate
+				if verbose {
+					fmt.Printf("[jwt-none] FLAGGED %s %s -> %d finding(s)\n", strings.ToUpper(j.op.Method), j.op.Path, len(fsJWT))
+				}
+			}
+			// 2) Your existing GET-only checks (schema/spec mismatch)
+			var fsGET []report.Finding
+			if strings.ToUpper(j.op.Method) == http.MethodGet && j.op.Raw != nil {
+				fsGET = checkGET(ctx, client, sp.Server, j.op.Path, j.op.Raw, hdrs)
+			}
+			//Error disclosure
+			fsED := securitymisconfig.CheckErrorDisclosure(ctx, client, sp.Server, j.op.Path, j.op.Method, hdrs)
+			if len(fsED) > 0 && verbose {
+				fmt.Printf("[error-disclosure] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fsED))
+			}
+			// merge
 			mu.Lock()
-			findings = append(findings, fs...)
-			findings = append(findings, fs2...)
+			findings = append(findings, fsNoTok...)
+			findings = append(findings, fsGET...)
+			findings = append(findings, fsJWT...)
+			findings = append(findings, fsED...)
 			mu.Unlock()
 		}
 	}
 
+	// Spin up workers
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go worker()
 	}
 
-	ops := sp.Operations()
-	for _, o := range ops {
-		if strings.ToUpper(o.Method) == http.MethodGet {
-			jobs <- job{op: o}
-		}
+	// Enqueue ALL operations (not just GET)
+	for _, o := range sp.Operations() {
+		jobs <- job{op: o}
 	}
-
 	close(jobs)
 	wg.Wait()
+
 	if verbose {
-		fmt.Printf("BrokenAuth(no-token): tested=%d flagged=%d\n", testedSecuredGET, flaggedNoToken)
+		fmt.Printf("BrokenAuth(no-token): tested=%d flagged=%d\n", testedSecured, flaggedNoToken)
 	}
+
+	// Global header/CORS checks (base URL)
 	findings = append(findings, checkCORSandHeaders(client, sp.Server, hdrs)...)
 
+	// Write report
 	rep := report.Report{Scanner: "kashef", Target: sp.Server, Findings: findings}
-
 	if strings.HasSuffix(strings.ToLower(out), ".md") {
 		if err := writeMarkdown(rep, out); err != nil {
 			return 2, err
@@ -104,6 +129,7 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 		}
 	}
 
+	// CI fail-on severity
 	threshold := report.Rank(strings.ToLower(failOn))
 	maxSeen := 0
 	for _, f := range findings {
@@ -112,7 +138,7 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 		}
 	}
 	if maxSeen >= threshold && threshold > 0 {
-		return 1, nil // fail CI
+		return 1, nil
 	}
 	return 0, nil
 }
