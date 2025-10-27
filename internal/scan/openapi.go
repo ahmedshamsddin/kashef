@@ -84,7 +84,7 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 			}
 			//Error disclosure
 			fsED := securitymisconfig.CheckErrorDisclosure(ctx, client, sp.Server, j.op.Path, j.op.Method, hdrs)
-			if len(fsED) > 0 && verbose {
+			if len(fsED) > 0 {
 				fmt.Printf("[error-disclosure] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fsED))
 			}
 			// merge
