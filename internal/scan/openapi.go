@@ -15,11 +15,12 @@ import (
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 	brokenauth "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api2_broken_auth"
+	ssrf "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api7_ssrf"
 	securitymisconfig "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api8_security_misconfig"
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duration, concurrency int, failOn string, verbose bool, allowWrite bool) (int, error) {
+func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duration, concurrency int, failOn string, verbose bool, allowWrite bool, token string) (int, error) {
 	ctx := context.Background()
 	sp, err := openapi.Load(ctx, specPath)
 	if err != nil {
@@ -55,7 +56,7 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 	worker := func() {
 		defer wg.Done()
 		for j := range jobs {
-			// 1) Broken Auth (no-token) for ANY secured op (GET/POST/PUT/PATCH/DELETE)
+			//1) Broken Auth (no-token) for ANY secured op (GET/POST/PUT/PATCH/DELETE)
 			if j.op.RequiresAuth {
 				atomic.AddInt32(&testedSecured, 1)
 				if verbose {
@@ -77,7 +78,7 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 					fmt.Printf("[jwt-none] FLAGGED %s %s -> %d finding(s)\n", strings.ToUpper(j.op.Method), j.op.Path, len(fsJWT))
 				}
 			}
-			// 2) Your existing GET-only checks (schema/spec mismatch)
+			//2) Your existing GET-only checks (schema/spec mismatch)
 			var fsGET []report.Finding
 			if strings.ToUpper(j.op.Method) == http.MethodGet && j.op.Raw != nil {
 				fsGET = checkGET(ctx, client, sp.Server, j.op.Path, j.op.Raw, hdrs)
@@ -87,12 +88,27 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 			if len(fsED) > 0 {
 				fmt.Printf("[error-disclosure] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fsED))
 			}
+
+			api7Ctx := ssrf.Context{
+				BaseURL:    detCtx.BaseURL,
+				Client:     detCtx.Client,
+				Headers:    detCtx.Headers,
+				AllowWrite: detCtx.AllowWrite,
+				Verbose:    detCtx.Verbose,
+				Token:      token,
+			}
+			fsSSRF := ssrf.DetectSSRF(ctx, api7Ctx, j.op)
+			if len(fsSSRF) > 0 {
+				fmt.Printf("[ssrf] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fsSSRF))
+			}
+
 			// merge
 			mu.Lock()
 			findings = append(findings, fsNoTok...)
 			findings = append(findings, fsGET...)
 			findings = append(findings, fsJWT...)
 			findings = append(findings, fsED...)
+			findings = append(findings, fsSSRF...)
 			mu.Unlock()
 		}
 	}

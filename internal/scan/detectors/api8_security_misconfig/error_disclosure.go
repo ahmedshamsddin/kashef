@@ -47,9 +47,9 @@ func CheckErrorDisclosure(ctx context.Context, client *http.Client, baseURL, pat
 		hdr = headers.Clone()
 	}
 	// Inject a synthetic/unsigned JWT only if no Authorization header exists
-	if hdr.Get("Authorization") == "" {
-		hdr.Set("Authorization", "Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.e30.")
-	}
+	// if hdr.Get("Authorization") == "" {
+	// 	hdr.Set("Authorization", "Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.e30.")
+	// }
 	req.Header = hdr
 
 	// perform request

@@ -13,6 +13,7 @@ type Operation struct {
 	PathParameterNames []string
 	IsCollection       bool
 	IsInstance         bool
+	OperationType      string
 	RequiresAuth       bool
 	Consumes           []string
 	Produces           []string
@@ -37,14 +38,12 @@ func (s *Spec) Operations() []Operation {
 		}
 
 		inheritedPathParams := collectPathParams(nil, pathItem.Parameters)
-
 		for methodLower, op := range pathItem.Operations() {
 			if op == nil {
 				continue
 			}
 
 			method := strings.ToUpper(methodLower)
-
 			allPathParams := collectPathParams(inheritedPathParams, op.Parameters)
 
 			requiresAuth := rootRequiresAuth
@@ -54,15 +53,18 @@ func (s *Spec) Operations() []Operation {
 			requestContentTypes, requestExamples := extractRequests(op.RequestBody)
 			responseContentTypes, responseExamples := extractResponses(op.Responses)
 
-			isCollection := method == "GET" && len(allPathParams) == 0
-			isInstance := (method == "GET" || method == "DELETE" || method == "PATCH" || method == "PUT") && len(allPathParams) > 0
+			hasPathParams := len(allPathParams) > 0
+			isInstance := hasPathParams
+			isCollection := !hasPathParams
 
+			opType := classifyOperationType(method, hasPathParams)
 			operations = append(operations, Operation{
 				Method:             method,
 				Path:               path,
 				PathParameterNames: allPathParams,
 				IsCollection:       isCollection,
 				IsInstance:         isInstance,
+				OperationType:      opType, // Optional
 				RequiresAuth:       requiresAuth,
 				Consumes:           requestContentTypes,
 				Produces:           responseContentTypes,
@@ -74,6 +76,37 @@ func (s *Spec) Operations() []Operation {
 	}
 
 	return operations
+}
+
+func classifyOperationType(method string, hasPathParams bool) string {
+	switch method {
+	case "GET":
+		if hasPathParams {
+			return "read" // GET /users/123
+		}
+		return "list" // GET /users
+
+	case "POST":
+		if hasPathParams {
+			return "action" // POST /users/123/verify
+		}
+		return "create" // POST /users
+
+	case "PUT":
+		return "replace" // PUT /users/123
+
+	case "PATCH":
+		return "update" // PATCH /users/123
+
+	case "DELETE":
+		if hasPathParams {
+			return "delete" // DELETE /users/123
+		}
+		return "bulk_delete" // DELETE /users (dangerous!)
+
+	default:
+		return "other"
+	}
 }
 
 func collectPathParams(existing []string, params openapi3.Parameters) []string {
@@ -106,6 +139,7 @@ func collectPathParams(existing []string, params openapi3.Parameters) []string {
 	for _, name := range existing {
 		add(name)
 	}
+
 	return names
 }
 

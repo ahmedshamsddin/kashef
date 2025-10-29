@@ -17,21 +17,22 @@ var (
 	failOn      string
 	verbose     bool
 	allowWrite  bool
+	token       string
 )
 
 func main() {
-	root := &cobra.Command{Use: "kashef", Short: "kashef — API scanner (safe)"}
+	root := &cobra.Command{Use: "kashef", Short: "kashef — API Vulnerability scanner"}
 
-	root.PersistentFlags().StringSliceVarP(&headers, "header", "H", nil, `-H "Authorization: Bearer XXX"`)
+	//root.PersistentFlags().StringSliceVarP(&headers, "header", "H", nil, `-H "Authorization: Bearer XXX"`)
 	root.PersistentFlags().DurationVarP(&timeout, "timeout", "t", 15*time.Second, "HTTP timeout")
 
 	scanCmd := &cobra.Command{Use: "scan", Short: "Scan targets"}
 	openapiCmd := &cobra.Command{
 		Use:   "openapi <spec-file-or-url>",
-		Short: "Scan using an OpenAPI spec (read-only)",
+		Short: "Scan using an OpenAPI spec",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			code, err := scan.RunOpenAPIScan(args[0], out, headers, timeout, concurrency, failOn, verbose, allowWrite)
+			code, err := scan.RunOpenAPIScan(args[0], out, headers, timeout, concurrency, failOn, verbose, allowWrite, token)
 			if err != nil {
 				return err
 			}
@@ -46,6 +47,7 @@ func main() {
 	openapiCmd.Flags().StringVar(&failOn, "fail-on", "medium", "Fail CI on >= severity (none|low|medium|high)")
 	openapiCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Print debug scan info")
 	openapiCmd.Flags().BoolVar(&allowWrite, "allow-write", false, "Allow POST/PUT/PATCH/DELETE probes (use only on staging)")
+	openapiCmd.Flags().StringVar(&token, "token", "", "Bearer token for Authorization header")
 
 	scanCmd.AddCommand(openapiCmd)
 	root.AddCommand(scanCmd)
