@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ahmedshamsddin/kashef/internal/detector"
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 	brokenauth "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api2_broken_auth"
@@ -31,7 +32,23 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 	hdrs := parseHeaders(headers)
 
 	var findings []report.Finding
-	findings = append(findings, headBase(client, sp.Server, hdrs)...)
+	findings = append(findings, headBase(client, sp.Server, hdrs, token)...)
+
+	detectorCtx := detector.NewContext(sp.Server, client, hdrs)
+	detectorCtx = detectorCtx.
+		WithToken(token).
+		WithAllowWrite(allowWrite).
+		WithVerbose(verbose).
+		WithTimeout(timeout)
+
+	if verbose {
+		fmt.Printf("Registered detectors: %d\n", detector.Count())
+		for _, d := range detector.List() {
+			info := d.Info()
+			fmt.Printf("  - %s (%s)\n", info.Name, info.ID)
+		}
+		fmt.Printf("\n")
+	}
 
 	type job struct {
 		op openapi.Operation
@@ -159,7 +176,7 @@ func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duratio
 	return 0, nil
 }
 
-func headBase(client *http.Client, base string, hdr http.Header) []report.Finding {
+func headBase(client *http.Client, base string, hdr http.Header, token string) []report.Finding {
 	req, _ := http.NewRequest(http.MethodHead, base, nil)
 	req.Header = hdr.Clone()
 	resp, err := client.Do(req)

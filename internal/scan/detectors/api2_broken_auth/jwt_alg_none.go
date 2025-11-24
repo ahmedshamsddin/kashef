@@ -10,11 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ahmedshamsddin/kashef/internal/detector"
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 )
 
-func DetectJWTAlgNone(ctx context.Context, sc Context, op openapi.Operation) []report.Finding {
+func DetectJWTAlgNone(ctx context.Context, sc *detector.Context, op openapi.Operation) []report.Finding {
 	out := []report.Finding{}
 
 	if !op.RequiresAuth {
