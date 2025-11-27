@@ -10,73 +10,81 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ahmedshamsddin/kashef/internal/detector"
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 )
 
-type Context struct {
-	BaseURL    string
-	Client     *http.Client
-	Headers    http.Header
-	AllowWrite bool
-	Verbose    bool
-	Token      string
+type SSRFDetector struct{}
+
+func init() {
+	detector.Register(&SSRFDetector{})
 }
 
-// var internalPayloads = []string{
-// 	"http://127.0.0.1/admin",
-// 	"http://localhost/admin",
-// 	"http://169.254.169.254/latest/meta-data/",
-// 	"file:///etc/passwd",
-// }
+func (d *SSRFDetector) Info() detector.DetectorInfo {
+	return detector.DetectorInfo{
+		ID:            "ssrf-oob",
+		Name:          "SSRF via Out-of-Band",
+		Description:   "Detects Server-Side Request Forgery using OOB callbacks",
+		OWASP:         "API7:2023",
+		Category:      "ssrf",
+		RequiresAuth:  false,
+		RequiresWrite: false,                // can test GET params
+		AppliesTo:     detector.AppliesTo{}, // all methods
+	}
+}
 
-// var externalPayloads = []string{
-// 	"http://example.com/",
-// 	"https://example.com/probe-ssrf",
-// }
-
-func DetectSSRF(ctx context.Context, sc Context, op openapi.Operation) []report.Finding {
-	out := []report.Finding{}
-	// Loop thourgh parameters and query strings to find potential SSRF vectors
-
+func (d *SSRFDetector) Detect(ctx context.Context, sc *detector.Context, op openapi.Operation) []report.Finding {
 	urlParams := extractURLParams(op)
 	requestBodyParams := extractURLRequestBodyFields(op)
+
 	if len(urlParams) == 0 && len(requestBodyParams) == 0 {
-		return out
+		return nil
 	}
 
-	oobServer := newSimpleOOBServer()
-	if err := oobServer.Start(ctx); err != nil {
+	// Check if OOB server factory is available
+	if sc.OOBServerFactory == nil {
+		if sc.Verbose {
+			fmt.Printf("[ssrf] OOB server factory not configured, skipping\n")
+		}
+		return nil
+	}
+
+	oobServer, err := sc.OOBServerFactory.Create()
+	if err != nil {
+		if sc.Verbose {
+			fmt.Printf("[ssrf] failed to create OOB server: %v\n", err)
+		}
+		return nil
+	}
+
+	if err := oobServer.Start(); err != nil {
 		if sc.Verbose {
 			fmt.Printf("[ssrf] failed to start OOB server: %v\n", err)
 		}
-		return out
+		return nil
 	}
 	defer oobServer.Stop()
 
-	if sc.Verbose {
-		fmt.Printf("[ssrf] OOB server listening at %s\n", oobServer.GetBaseURL())
-	}
+	var findings []report.Finding
 
 	// Test URL parameters
 	for _, param := range urlParams {
-		findings := testSSRFWithOOB(ctx, sc, op, param, "param", oobServer)
-		out = append(out, findings...)
+		results := d.testSSRFWithOOB(ctx, sc, op, param, "param", oobServer)
+		findings = append(findings, results...)
 	}
 
 	// Test request body fields
 	for _, field := range requestBodyParams {
-		findings := testSSRFWithOOB(ctx, sc, op, field, "body", oobServer)
-		out = append(out, findings...)
+		results := d.testSSRFWithOOB(ctx, sc, op, field, "body", oobServer)
+		findings = append(findings, results...)
 	}
 
-	return out
+	return findings
 }
 
-func testSSRFWithOOB(ctx context.Context, sc Context, op openapi.Operation,
-	paramName, paramType string, oobServer *SimpleOOBServer) []report.Finding {
-
-	out := []report.Finding{}
+func (d *SSRFDetector) testSSRFWithOOB(ctx context.Context, sc *detector.Context, op openapi.Operation,
+	paramName, paramType string, oobServer detector.OOBServer) []report.Finding {
 
 	identifier := fmt.Sprintf("ssrf-%s-%s-%d",
 		sanitize(op.Path),
@@ -92,47 +100,99 @@ func testSSRFWithOOB(ctx context.Context, sc Context, op openapi.Operation,
 
 	var err error
 	if paramType == "param" {
-		err = sendRequestWithURLParam(ctx, sc, op, paramName, oobURL)
+		err = d.sendRequestWithURLParam(ctx, sc, op, paramName, oobURL)
 	} else {
-		err = sendRequestWithBodyField(ctx, sc, op, paramName, oobURL)
+		if !sc.AllowWrite {
+			return nil // skip body tests if write not allowed
+		}
+		err = d.sendRequestWithBodyField(ctx, sc, op, paramName, oobURL)
 	}
 
 	if err != nil {
 		if sc.Verbose {
 			fmt.Printf("[ssrf] request failed: %v\n", err)
 		}
-		return out
+		return nil
 	}
 
 	timeout := 5 * time.Second
 	callbackReceived := oobServer.CheckCallback(identifier, timeout)
 
 	if callbackReceived {
-		// SSRF confirmed!
-		record := oobServer.GetCallbackRecord(identifier)
-
-		out = append(out, report.Finding{
-			ID:       "A-706",
-			Severity: "critical",
-			Category: "ssrf.confirmed",
-			Endpoint: op.Path,
-			Method:   op.Method,
-			Evidence: map[string]interface{}{
-				"parameter_name":    paramName,
-				"parameter_type":    paramType,
-				"oob_url":           oobURL,
-				"callback_received": true,
-				"callback_time":     record.ReceivedAt.Format(time.RFC3339),
-				"callback_method":   record.Method,
-				"reason":            "target API made request to OOB server, confirming SSRF",
-			},
-			Remedy: "Validate and sanitize all URL inputs. Implement allowlist of permitted domains. Block private IP ranges and localhost.",
-		})
+		return detector.NewFinding("A-706", "ssrf").
+			WithSeverity("critical").
+			WithEndpoint(op.Method, op.Path).
+			WithEvidence("parameter_name", paramName).
+			WithEvidence("parameter_type", paramType).
+			WithEvidence("oob_url", oobURL).
+			WithEvidence("callback_received", true).
+			WithReason("target API made request to OOB server, confirming SSRF").
+			WithRemedy("Validate and sanitize all URL inputs. Implement allowlist of permitted domains. Block private IP ranges and localhost.").
+			BuildSlice()
 	}
 
-	return out
+	return nil
 }
 
+func (d *SSRFDetector) sendRequestWithURLParam(ctx context.Context, sc *detector.Context, op openapi.Operation,
+	paramName, oobURL string) error {
+
+	reqURL := strings.TrimRight(sc.BaseURL, "/") + op.Path
+
+	if strings.Contains(reqURL, "?") {
+		reqURL += "&"
+	} else {
+		reqURL += "?"
+	}
+	reqURL += paramName + "=" + url.QueryEscape(oobURL)
+
+	req, err := http.NewRequestWithContext(ctx, op.Method, reqURL, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header = sc.Headers.Clone()
+	if authHeader := sc.GetAuthHeader(); authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	resp, err := sc.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func (d *SSRFDetector) sendRequestWithBodyField(ctx context.Context, sc *detector.Context, op openapi.Operation,
+	fieldName, oobURL string) error {
+
+	payload := fmt.Sprintf(`{"%s": "%s"}`, fieldName, oobURL)
+	reqURL := strings.TrimRight(sc.BaseURL, "/") + op.Path
+
+	req, err := http.NewRequestWithContext(ctx, op.Method, reqURL,
+		strings.NewReader(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header = sc.Headers.Clone()
+	req.Header.Set("Content-Type", "application/json")
+	if authHeader := sc.GetAuthHeader(); authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	resp, err := sc.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	io.Copy(io.Discard, resp.Body)
+	return nil
+}
 func extractURLParams(op openapi.Operation) []string {
 	params := []string{}
 
@@ -198,79 +258,6 @@ func extractURLRequestBodyFields(op openapi.Operation) []string {
 	}
 
 	return fields
-}
-
-func sendRequestWithURLParam(ctx context.Context, sc Context, op openapi.Operation,
-	paramName, oobURL string) error {
-	fmt.Println("sending request with url")
-
-	reqURL := strings.TrimRight(sc.BaseURL, "/") + op.Path
-
-	if strings.Contains(reqURL, "?") {
-		reqURL += "&"
-	} else {
-		reqURL += "?"
-	}
-	reqURL += paramName + "=" + url.QueryEscape(oobURL)
-
-	req, err := http.NewRequestWithContext(ctx, op.Method, reqURL, nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header = sc.Headers.Clone()
-	// add auth token if available
-	if sc.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+sc.Token)
-	}
-
-	resp, err := sc.Client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Drain and discard body
-	io.Copy(io.Discard, resp.Body)
-
-	return nil
-}
-
-// Send request with body field
-func sendRequestWithBodyField(ctx context.Context, sc Context, op openapi.Operation,
-	fieldName, oobURL string) error {
-
-	if !sc.AllowWrite {
-		return fmt.Errorf("write operations not allowed")
-	}
-
-	// Build JSON payload
-	payload := fmt.Sprintf(`{"%s": "%s"}`, fieldName, oobURL)
-	fmt.Println(payload)
-	reqURL := strings.TrimRight(sc.BaseURL, "/") + op.Path
-	req, err := http.NewRequestWithContext(ctx, op.Method, reqURL,
-		strings.NewReader(payload))
-	if err != nil {
-		return err
-	}
-
-	req.Header = sc.Headers.Clone()
-	req.Header.Set("Content-Type", "application/json")
-	// add auth token if available
-	if sc.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+sc.Token)
-	}
-
-	resp, err := sc.Client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Drain and discard body
-	io.Copy(io.Discard, resp.Body)
-
-	return nil
 }
 
 func looksURLish(name string) bool {

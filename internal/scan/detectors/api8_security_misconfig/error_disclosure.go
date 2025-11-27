@@ -8,10 +8,33 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ahmedshamsddin/kashef/internal/detector"
+	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 )
 
-// ...existing code...
+type ErrorDisclosureDetector struct{}
+
+func init() {
+	detector.Register(&ErrorDisclosureDetector{})
+}
+
+func (d *ErrorDisclosureDetector) Info() detector.DetectorInfo {
+	return detector.DetectorInfo{
+		ID:            "error-disclosure",
+		Name:          "Error Information Disclosure",
+		Description:   "Detects verbose error messages exposing internal details",
+		OWASP:         "API8:2023",
+		Category:      "security-misconfig",
+		RequiresAuth:  false,
+		RequiresWrite: false,
+		AppliesTo:     detector.AppliesTo{}, // all methods
+	}
+}
+
+func (d *ErrorDisclosureDetector) Detect(ctx context.Context, sc *detector.Context, op openapi.Operation) []report.Finding {
+	return CheckErrorDisclosure(ctx, sc.Client, sc.BaseURL, op.Path, op.Method, sc.Headers)
+}
 
 func CheckErrorDisclosure(ctx context.Context, client *http.Client, baseURL, path, method string, headers http.Header) []report.Finding {
 	// ensure context
