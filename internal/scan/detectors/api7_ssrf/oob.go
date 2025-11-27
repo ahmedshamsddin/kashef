@@ -83,11 +83,14 @@ func (s *SimpleOOBServer) Start(ctx context.Context) error {
 
 	// 4) Serve
 	go func() {
-		close(s.ready) // signal ready (ensure s.ready was created)
 		if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("OOB server error: %v\n", err)
 		}
 	}()
+
+	// Give server time to start
+	time.Sleep(100 * time.Millisecond)
+	close(s.ready)
 
 	<-s.ready
 	fmt.Printf("[oob] listening on %s (advertised: %s)\n", ln.Addr().String(), s.baseURL)

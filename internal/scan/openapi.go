@@ -4,483 +4,311 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/ahmedshamsddin/kashef/internal/detector"
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
-	brokenauth "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api2_broken_auth"
 	ssrf "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api7_ssrf"
 	securitymisconfig "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api8_security_misconfig"
-	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/ahmedshamsddin/kashef/internal/scan/detectors/connectivity"
 )
 
-func RunOpenAPIScan(specPath, out string, headers []string, timeout time.Duration, concurrency int, failOn string, verbose bool, allowWrite bool, token string) (int, error) {
+// RunOpenAPIScan orchestrates the complete security scan of an OpenAPI specification
+func RunOpenAPIScan(
+	specPath, out string,
+	headers []string,
+	timeout time.Duration,
+	concurrency int,
+	failOn string,
+	verbose bool,
+	allowWrite bool,
+	token string,
+) (int, error) {
 	ctx := context.Background()
-	sp, err := openapi.Load(ctx, specPath)
+
+	// Load and validate OpenAPI specification
+	spec, err := openapi.Load(ctx, specPath)
 	if err != nil {
-		return 2, err
+		return 2, fmt.Errorf("failed to load OpenAPI spec: %w", err)
 	}
 
+	// Initialize HTTP client and scanner context
 	client := &http.Client{Timeout: timeout}
-	hdrs := parseHeaders(headers)
+	parsedHeaders := parseHeaders(headers)
 
+	scanner := newScanner(spec, client, parsedHeaders, token, allowWrite, verbose, timeout)
+
+	if verbose {
+		scanner.printDetectorInfo()
+	}
+
+	// Run the scan
+	findings := scanner.scan(ctx, concurrency)
+
+	// Generate and write report
+	if err := scanner.writeReport(findings, out); err != nil {
+		return 2, fmt.Errorf("failed to write report: %w", err)
+	}
+
+	// Determine exit code based on severity threshold
+	return scanner.evaluateExitCode(findings, failOn), nil
+}
+
+// scanner encapsulates all scanning logic and state
+type scanner struct {
+	spec        *openapi.Spec
+	client      *http.Client
+	headers     http.Header
+	detectorCtx *detector.Context
+	verbose     bool
+}
+
+// newScanner creates a new scanner instance with properly configured context
+func newScanner(
+	spec *openapi.Spec,
+	client *http.Client,
+	headers http.Header,
+	token string,
+	allowWrite bool,
+	verbose bool,
+	timeout time.Duration,
+) *scanner {
+	// Setup detector context with all necessary configuration
+	detectorCtx := detector.NewContext(spec.Server, client, headers).
+		WithToken(token).
+		WithAllowWrite(allowWrite).
+		WithVerbose(verbose).
+		WithTimeout(timeout)
+
+	// Configure OOB server factory for SSRF detection
+	detectorCtx.OOBServerFactory = ssrf.NewOOBFactory()
+
+	return &scanner{
+		spec:        spec,
+		client:      client,
+		headers:     headers,
+		detectorCtx: detectorCtx,
+		verbose:     verbose,
+	}
+}
+
+// printDetectorInfo displays registered detector information
+func (s *scanner) printDetectorInfo() {
+	fmt.Printf("Registered detectors: %d\n", detector.Count())
+	for _, d := range detector.List() {
+		info := d.Info()
+		fmt.Printf("  - %s (%s)\n", info.Name, info.ID)
+	}
+	fmt.Println()
+}
+
+// scan performs the actual security scanning using concurrent workers
+func (s *scanner) scan(ctx context.Context, concurrency int) []report.Finding {
 	var findings []report.Finding
-	findings = append(findings, headBase(client, sp.Server, hdrs)...)
 
+	// Initial connectivity check
+	findings = append(findings, s.checkConnectivity()...)
+
+	// Scan all operations concurrently
+	operationFindings := s.scanOperations(ctx, concurrency)
+	findings = append(findings, operationFindings...)
+
+	// Global security checks (CORS, headers)
+	findings = append(findings, s.checkGlobalSecurity()...)
+
+	return findings
+}
+
+// scanOperations scans all API operations using a worker pool
+func (s *scanner) scanOperations(ctx context.Context, concurrency int) []report.Finding {
 	type job struct {
 		op openapi.Operation
 	}
 
-	// Debug counters
-	var testedSecured int32
-	var flaggedNoToken int32
-
-	detCtx := brokenauth.Context{
-		BaseURL:    sp.Server,
-		Client:     client,
-		Headers:    hdrs,
-		AllowWrite: allowWrite,
-		Verbose:    verbose,
-	}
-
-	jobs := make(chan job)
+	jobs := make(chan job, len(s.spec.Operations()))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	var findings []report.Finding
 
+	// Worker function
 	worker := func() {
 		defer wg.Done()
 		for j := range jobs {
-			//1) Broken Auth (no-token) for ANY secured op (GET/POST/PUT/PATCH/DELETE)
-			if j.op.RequiresAuth {
-				atomic.AddInt32(&testedSecured, 1)
-				if verbose {
-					fmt.Printf("[no-token] testing %s %s\n", strings.ToUpper(j.op.Method), j.op.Path)
-				}
-			}
-			fsNoTok := brokenauth.DetectNoToken(ctx, detCtx, j.op)
-			if len(fsNoTok) > 0 {
-				atomic.AddInt32(&flaggedNoToken, int32(len(fsNoTok)))
-				if verbose {
-					fmt.Printf("[no-token] FLAGGED %s %s -> %d finding(s)\n",
-						strings.ToUpper(j.op.Method), j.op.Path, len(fsNoTok))
-				}
-			}
-			fsJWT := brokenauth.DetectJWTAlgNone(ctx, detCtx, j.op)
-			if len(fsJWT) > 0 {
-				atomic.AddInt32(&flaggedNoToken, int32(len(fsJWT))) // you can keep using same counter or make separate
-				if verbose {
-					fmt.Printf("[jwt-none] FLAGGED %s %s -> %d finding(s)\n", strings.ToUpper(j.op.Method), j.op.Path, len(fsJWT))
-				}
-			}
-			//2) Your existing GET-only checks (schema/spec mismatch)
-			var fsGET []report.Finding
-			if strings.ToUpper(j.op.Method) == http.MethodGet && j.op.Raw != nil {
-				fsGET = checkGET(ctx, client, sp.Server, j.op.Path, j.op.Raw, hdrs)
-			}
-			//Error disclosure
-			fsED := securitymisconfig.CheckErrorDisclosure(ctx, client, sp.Server, j.op.Path, j.op.Method, hdrs)
-			if len(fsED) > 0 {
-				fmt.Printf("[error-disclosure] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fsED))
-			}
+			opFindings := s.scanOperation(ctx, j.op)
 
-			api7Ctx := ssrf.Context{
-				BaseURL:    detCtx.BaseURL,
-				Client:     detCtx.Client,
-				Headers:    detCtx.Headers,
-				AllowWrite: detCtx.AllowWrite,
-				Verbose:    detCtx.Verbose,
-				Token:      token,
-			}
-			fsSSRF := ssrf.DetectSSRF(ctx, api7Ctx, j.op)
-			if len(fsSSRF) > 0 {
-				fmt.Printf("[ssrf] FLAGGED %s %s -> %d finding(s)\n", j.op.Method, j.op.Path, len(fsSSRF))
-			}
-
-			// merge
 			mu.Lock()
-			findings = append(findings, fsNoTok...)
-			findings = append(findings, fsGET...)
-			findings = append(findings, fsJWT...)
-			findings = append(findings, fsED...)
-			findings = append(findings, fsSSRF...)
+			findings = append(findings, opFindings...)
 			mu.Unlock()
 		}
 	}
 
-	// Spin up workers
+	// Start worker pool
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go worker()
 	}
 
-	// Enqueue ALL operations (not just GET)
-	for _, o := range sp.Operations() {
-		jobs <- job{op: o}
+	// Enqueue all operations
+	for _, op := range s.spec.Operations() {
+		jobs <- job{op: op}
 	}
 	close(jobs)
+
+	// Wait for all workers to complete
 	wg.Wait()
 
-	if verbose {
-		fmt.Printf("BrokenAuth(no-token): tested=%d flagged=%d\n", testedSecured, flaggedNoToken)
+	return findings
+}
+
+// scanOperation scans a single API operation using the detector registry
+func (s *scanner) scanOperation(ctx context.Context, op openapi.Operation) []report.Finding {
+	// Run all registered detectors via registry
+	return detector.RunAll(ctx, s.detectorCtx, op)
+}
+
+// checkConnectivity performs initial connectivity check against the base URL
+func (s *scanner) checkConnectivity() []report.Finding {
+	return connectivity.CheckConnectivity(s.client, s.spec.Server, s.headers)
+}
+
+// checkGlobalSecurity performs global security checks (CORS, headers)
+func (s *scanner) checkGlobalSecurity() []report.Finding {
+	var findings []report.Finding
+
+	corsFindings := s.checkCORS()
+	findings = append(findings, corsFindings...)
+
+	headerFindings := s.checkSecurityHeaders()
+	findings = append(findings, headerFindings...)
+
+	return findings
+}
+
+// checkCORS checks for CORS misconfigurations
+func (s *scanner) checkCORS() []report.Finding {
+	return securitymisconfig.CheckCORS(s.client, s.spec.Server, s.headers)
+}
+
+// checkSecurityHeaders checks for missing security headers
+func (s *scanner) checkSecurityHeaders() []report.Finding {
+	return securitymisconfig.CheckSecurityHeaders(s.client, s.spec.Server, s.headers)
+}
+
+// writeReport generates and writes the scan report
+func (s *scanner) writeReport(findings []report.Finding, outputPath string) error {
+	rep := report.Report{
+		Scanner:  "kashef",
+		Target:   s.spec.Server,
+		Findings: findings,
 	}
 
-	// Global header/CORS checks (base URL)
-	findings = append(findings, checkCORSandHeaders(client, sp.Server, hdrs)...)
-
-	// Write report
-	rep := report.Report{Scanner: "kashef", Target: sp.Server, Findings: findings}
-	if strings.HasSuffix(strings.ToLower(out), ".md") {
-		if err := writeMarkdown(rep, out); err != nil {
-			return 2, err
-		}
-	} else {
-		if err := writeJSON(rep, out); err != nil {
-			return 2, err
-		}
+	if strings.HasSuffix(strings.ToLower(outputPath), ".md") {
+		return writeMarkdown(rep, outputPath)
 	}
+	return writeJSON(rep, outputPath)
+}
 
-	// CI fail-on severity
+// evaluateExitCode determines exit code based on severity threshold
+func (s *scanner) evaluateExitCode(findings []report.Finding, failOn string) int {
 	threshold := report.Rank(strings.ToLower(failOn))
-	maxSeen := 0
+	if threshold == 0 {
+		return 0 // No threshold set
+	}
+
+	maxSeverity := 0
 	for _, f := range findings {
-		if r := report.Rank(f.Severity); r > maxSeen {
-			maxSeen = r
+		if rank := report.Rank(f.Severity); rank > maxSeverity {
+			maxSeverity = rank
 		}
 	}
-	if maxSeen >= threshold && threshold > 0 {
-		return 1, nil
+
+	if maxSeverity >= threshold {
+		return 1 // Threshold exceeded
 	}
-	return 0, nil
+	return 0
 }
 
-func headBase(client *http.Client, base string, hdr http.Header) []report.Finding {
-	req, _ := http.NewRequest(http.MethodHead, base, nil)
-	req.Header = hdr.Clone()
-	resp, err := client.Do(req)
-	out := []report.Finding{}
-	if err != nil {
-		return append(out, report.Finding{
-			ID: "A-0002", Severity: "high", Category: "connectivity",
-			Evidence: map[string]interface{}{"error": err.Error()},
-		})
-	}
-	defer closeBody(resp)
-	out = append(out, report.Finding{
-		ID: "A-0000", Severity: "info", Category: "connectivity",
-		Evidence: map[string]interface{}{"status": resp.StatusCode},
-	})
-	if resp.StatusCode >= 500 {
-		out = append(out, report.Finding{
-			ID: "A-0001", Severity: "medium", Category: "runtime",
-			Evidence: map[string]interface{}{"status": resp.StatusCode},
-		})
-	}
-	return out
-}
+// Helper functions
 
-func parseHeaders(hs []string) http.Header {
+func parseHeaders(headers []string) http.Header {
 	h := http.Header{}
-
-	for _, s := range hs {
-		if i := strings.Index(s, ":"); i > 0 {
-			k := strings.TrimSpace(s[:i])
-			v := strings.TrimSpace(s[i+1:])
-			h.Add(k, v)
+	for _, s := range headers {
+		if idx := strings.Index(s, ":"); idx > 0 {
+			key := strings.TrimSpace(s[:idx])
+			value := strings.TrimSpace(s[idx+1:])
+			h.Add(key, value)
 		}
 	}
 	return h
 }
 
-func compareAgainstSchemaObject(schema *openapi3.Schema, data any) []map[string]interface{} {
-	results := []map[string]interface{}{}
-	if schema == nil {
-		return results
-	}
+// Report writing functions
 
-	// If array: best-effort validate first item as object
-	if schema.Items != nil && schema.Items.Value != nil {
-		if arr, ok := data.([]any); ok && len(arr) > 0 {
-			return compareAgainstSchemaObject(schema.Items.Value, arr[0])
-		}
-		// Type hint (schema says array, got non-array)
-		if _, ok := data.([]any); !ok {
-			results = append(results, map[string]interface{}{
-				"reason":   "expected array per schema",
-				"dataType": fmt.Sprintf("%T", data),
-			})
-		}
-		return results
-	}
-
-	// Treat as object-like if there are properties, or additionalProperties is defined (boolean or schema)
-	objLike := len(schema.Properties) > 0 ||
-		schema.AdditionalProperties.Schema != nil ||
-		schema.AdditionalProperties.Has != nil
-	if !objLike {
-		return results // nothing concrete to check
-	}
-
-	// Must be an object at runtime
-	obj, ok := data.(map[string]any)
-	if !ok {
-		results = append(results, map[string]interface{}{
-			"reason":   "expected object per schema",
-			"dataType": fmt.Sprintf("%T", data),
-		})
-		return results
-	}
-
-	// Declared property set
-	declared := map[string]struct{}{}
-	for name := range schema.Properties {
-		declared[name] = struct{}{}
-	}
-
-	// Missing required
-	var missing []string
-	for _, req := range schema.Required {
-		if _, ok := obj[req]; !ok {
-			missing = append(missing, req)
-		}
-	}
-	if len(missing) > 0 {
-		results = append(results, map[string]interface{}{"missingRequired": missing})
-	}
-
-	// Determine if additionalProperties is allowed.
-	// Default OpenAPI behavior: allowed unless explicitly set to false.
-	allowed := true
-	ap := schema.AdditionalProperties
-	switch {
-	case ap.Schema != nil:
-		allowed = true // schema for additional props → allowed
-	case ap.Has != nil:
-		allowed = *ap.Has // boolean form provided
-	default:
-		allowed = true // no info → default allow
-	}
-
-	// Extra fields (only when explicitly disallowed)
-	if !allowed {
-		var extra []string
-		for k := range obj {
-			if _, ok := declared[k]; !ok {
-				extra = append(extra, k)
-			}
-		}
-		if len(extra) > 0 {
-			results = append(results, map[string]interface{}{"extraFields": extra})
-		}
-	}
-
-	return results
-}
-func checkGET(ctx context.Context, client *http.Client, base, pth string, op *openapi3.Operation, hdr http.Header) []report.Finding {
-	url := strings.TrimRight(base, "/") + pth
-
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	req.Header = hdr.Clone()
-
-	resp, err := client.Do(req)
-	out := []report.Finding{}
-	if err != nil {
-		return append(out, report.Finding{
-			ID: "A-012", Severity: "high", Category: "runtime",
-			Endpoint: pth, Method: "GET",
-			Evidence: map[string]interface{}{"error": err.Error()},
-		})
-	}
-	// close once, at the end
-	defer closeBody(resp)
-
-	// --- Status drift check ---
-	decl := map[int]struct{}{}
-	for code := range op.Responses.Map() {
-		if n, e := parseStatus(code); e == nil {
-			decl[n] = struct{}{}
-		}
-	}
-	if len(decl) > 0 {
-		if _, ok := decl[resp.StatusCode]; !ok {
-			out = append(out, report.Finding{
-				ID: "A-010", Severity: "medium", Category: "spec-runtime-mismatch",
-				Endpoint: pth, Method: "GET",
-				Evidence: map[string]interface{}{"status": resp.StatusCode, "declared": keys(decl)},
-				Remedy:   "Align handler or declare status in OpenAPI.",
-			})
-		}
-	}
-
-	// --- JSON schema validation (only if JSON) ---
-	ct := strings.ToLower(resp.Header.Get("content-type"))
-	if strings.HasPrefix(ct, "application/json") {
-		body, _ := io.ReadAll(resp.Body)
-
-		if len(body) == 0 {
-			out = append(out, report.Finding{
-				ID: "A-013", Severity: "medium", Category: "runtime",
-				Endpoint: pth, Method: "GET",
-				Evidence: map[string]interface{}{"reason": "empty JSON body"},
-				Remedy:   "Ensure handler returns a valid JSON body or correct Content-Type.",
-			})
-			return out
-		}
-
-		// Pick the declared schema (for this status or fallback 200)
-		if sch := pickJSONSchema(op, resp.StatusCode); sch != nil && sch.Value != nil {
-			var data any
-			if err := json.Unmarshal(body, &data); err != nil {
-				out = append(out, report.Finding{
-					ID: "A-014", Severity: "medium", Category: "runtime",
-					Endpoint: pth, Method: "GET",
-					Evidence: map[string]interface{}{"jsonParseError": err.Error()},
-					Remedy:   "Return valid JSON or fix Content-Type.",
-				})
-			} else {
-				// Lightweight object/array-of-objects check against properties/required
-				findings := compareAgainstSchemaObject(sch.Value, data)
-				if len(findings) > 0 {
-					for _, ev := range findings {
-						out = append(out, report.Finding{
-							ID: "A-011", Severity: "high", Category: "schema",
-							Endpoint: pth, Method: "GET",
-							Evidence: ev,
-							Remedy:   "Fix response to match schema properties/required or update the schema.",
-						})
-					}
-				}
-			}
-		}
-	}
-
-	return out
-}
-
-func parseStatus(s string) (int, error) {
-	var n int
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
-}
-
-func keys(m map[int]struct{}) []int {
-	out := make([]int, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-func closeBody(resp *http.Response) {
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-}
-
-func pickJSONSchema(op *openapi3.Operation, status int) *openapi3.SchemaRef {
-	if op == nil || op.Responses == nil {
-		return nil
-	}
-	respMap := op.Responses.Map()
-
-	codeStr := fmt.Sprintf("%d", status)
-	var respRef *openapi3.ResponseRef
-	if ref, ok := respMap[codeStr]; ok {
-		respRef = ref
-	} else if ref, ok := respMap["200"]; ok {
-		respRef = ref
-	}
-	if respRef == nil || respRef.Value == nil {
-		return nil
-	}
-	mt := respRef.Value.Content.Get("application/json")
-	if mt == nil || mt.Schema == nil {
-		return nil
-	}
-	return mt.Schema
-}
-
-func checkCORSandHeaders(client *http.Client, base string, hdr http.Header) []report.Finding {
-	out := []report.Finding{}
-	req, _ := http.NewRequest(http.MethodOptions, base, nil)
-	req.Header = hdr.Clone()
-	if resp, err := client.Do(req); err == nil {
-		acao := resp.Header.Get("Access-Control-Allow-Origin")
-		acc := strings.ToLower(resp.Header.Get("Access-Control-Allow-Credentials"))
-		if acao == "*" && acc == "true" {
-			out = append(out, report.Finding{
-				ID: "A-020", Severity: "high", Category: "cors",
-				Evidence: map[string]interface{}{"allow-origin": acao, "allow-credentials": acc},
-				Remedy:   "Do not use wildcard origin with credentials; restrict origins.",
-			})
-		}
-		closeBody(resp)
-	}
-
-	req2, _ := http.NewRequest(http.MethodOptions, base, nil)
-	req2.Header = hdr.Clone()
-
-	if resp, err := client.Do(req2); err == nil {
-		present := map[string]bool{}
-		for k := range resp.Header {
-			present[strings.ToLower(k)] = true
-		}
-		var missing []string
-
-		for _, h := range []string{"strict-transport-security", "x-frame-options", "x-content-type-options"} {
-			if !present[h] {
-				missing = append(missing, h)
-			}
-		}
-
-		if len(missing) > 0 {
-			out = append(out, report.Finding{
-				ID: "A-023", Severity: "medium", Category: "headers",
-				Evidence: map[string]interface{}{"missing": missing},
-				Remedy:   "Add standard security headers.",
-			})
-		}
-		closeBody(resp)
-	}
-
-	return out
-}
-
-// Write JSON
-func writeJSON(rep report.Report, out string) error {
-	f, err := os.Create(out)
+func writeJSON(rep report.Report, outputPath string) error {
+	f, err := os.Create(outputPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(rep)
 }
 
-// Write Markdown
-func writeMarkdown(rep report.Report, out string) error {
+func writeMarkdown(rep report.Report, outputPath string) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# kashef Report\n- Target: `%s`\n\n", rep.Target)
-	for _, f := range rep.Findings {
-		fmt.Fprintf(&b, "## %s — %s\n- Severity: **%s**\n- Category: `%s`\n",
-			f.ID, f.Category, f.Severity, f.Category)
-		if f.Endpoint != "" {
-			fmt.Fprintf(&b, "- Endpoint: `%s` `%s`\n", f.Endpoint, f.Method)
+
+	fmt.Fprintf(&b, "# Kashef Security Report\n\n")
+	fmt.Fprintf(&b, "**Target:** `%s`\n\n", rep.Target)
+	fmt.Fprintf(&b, "**Total Findings:** %d\n\n", len(rep.Findings))
+
+	// Group findings by severity
+	severityGroups := groupBySeverity(rep.Findings)
+	for _, severity := range []string{"critical", "high", "medium", "low", "info"} {
+		findings := severityGroups[severity]
+		if len(findings) == 0 {
+			continue
 		}
-		if len(f.Evidence) > 0 {
-			ev, _ := json.MarshalIndent(f.Evidence, "", "  ")
-			fmt.Fprintf(&b, "```json\n%s\n```\n", ev)
+
+		// Properly capitalize severity (strings.Title is deprecated)
+		severityTitle := strings.ToUpper(severity[:1]) + severity[1:]
+		fmt.Fprintf(&b, "## %s Severity (%d)\n\n", severityTitle, len(findings))
+
+		for _, f := range findings {
+			fmt.Fprintf(&b, "### %s - %s\n\n", f.ID, f.Category)
+
+			if f.Endpoint != "" {
+				fmt.Fprintf(&b, "**Endpoint:** `%s %s`\n\n", f.Method, f.Endpoint)
+			}
+
+			if len(f.Evidence) > 0 {
+				fmt.Fprintf(&b, "**Evidence:**\n\n```json\n")
+				ev, _ := json.MarshalIndent(f.Evidence, "", "  ")
+				fmt.Fprintf(&b, "%s\n```\n\n", ev)
+			}
+
+			if f.Remedy != "" {
+				fmt.Fprintf(&b, "**Remediation:** %s\n\n", f.Remedy)
+			}
+
+			fmt.Fprintln(&b, "---\n")
 		}
-		if f.Remedy != "" {
-			fmt.Fprintf(&b, "**Remediation:** %s\n", f.Remedy)
-		}
-		fmt.Fprintln(&b)
 	}
-	return os.WriteFile(out, []byte(b.String()), 0o644)
+
+	return os.WriteFile(outputPath, []byte(b.String()), 0o644)
+}
+
+func groupBySeverity(findings []report.Finding) map[string][]report.Finding {
+	groups := make(map[string][]report.Finding)
+	for _, f := range findings {
+		severity := strings.ToLower(f.Severity)
+		groups[severity] = append(groups[severity], f)
+	}
+	return groups
 }

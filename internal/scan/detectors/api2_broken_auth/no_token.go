@@ -6,53 +6,128 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/ahmedshamsddin/kashef/internal/detector"
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 )
 
-// Context is detector runtime context.
-type Context struct {
-	BaseURL    string
-	Client     *http.Client
-	Headers    http.Header
-	AllowWrite bool
-	Verbose    bool
+type NoTokenDetector struct{}
+
+func init() {
+	detector.Register(&NoTokenDetector{})
 }
 
-func DetectNoToken(ctx context.Context, sc Context, op openapi.Operation) []report.Finding {
-	out := []report.Finding{}
-	if !op.RequiresAuth {
-		return out
+func (d *NoTokenDetector) Info() detector.DetectorInfo {
+	return detector.DetectorInfo{
+		ID:            "auth-no-token",
+		Name:          "Missing Authentication Token",
+		Description:   "Detects secured endpoints that respond successfully without authentication token",
+		OWASP:         "API2:2023",
+		Category:      "broken-auth",
+		RequiresAuth:  true,
+		RequiresWrite: false,
+		AppliesTo:     detector.AppliesTo{}, // all methods
 	}
+}
 
+func (d *NoTokenDetector) Detect(ctx context.Context, scanCtx *detector.Context, op openapi.Operation) []report.Finding {
 	method := strings.ToUpper(op.Method)
+
 	switch method {
 	case http.MethodGet:
-		return tryNoToken(ctx, sc, op, nil, "")
-	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-		// Only attempt if user allows writes, otherwise do a conservative probe.
-		if !sc.AllowWrite {
-			// For POST/PUT/PATCH send the best example body if available (benign).
-			// For DELETE, we can only probe if it won't harm; in read-only, skip delete.
+		return d.tryNoToken(ctx, scanCtx, op, nil, "")
+	case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+		if !scanCtx.AllowWrite {
 			if method == http.MethodDelete {
-				return out
+				return nil
 			}
+
 			mt, body := pickExample(op.RequestExamples)
 			if body == nil {
-				// No example -> sending an empty body will likely be 400; inconclusive.
-				return out
+				return nil
 			}
-			return tryNoToken(ctx, sc, op, body, mt)
+			return d.tryNoToken(ctx, scanCtx, op, body, mt)
 		}
-		// AllowWrite=true: proceed with example-based body for create/update; for DELETE it’s caller’s choice.
-		mt, body := pickExample(op.RequestExamples)
-		if method != http.MethodDelete && body == nil {
-			// No example -> avoid blind writes; inconclusive.
-			return out
-		}
-		return tryNoToken(ctx, sc, op, body, mt)
 	default:
-		return out
+		return nil
+	}
+
+	return nil
+}
+
+func (d *NoTokenDetector) tryNoToken(ctx context.Context, scanCtx *detector.Context, op openapi.Operation, body []byte, contentType string) []report.Finding {
+	headers := scanCtx.Headers.Clone()
+	headers.Del("Authorization")
+
+	if contentType != "" {
+		headers.Set("Content-Type", contentType)
+	}
+
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = strings.NewReader(string(body))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, op.Method, strings.TrimRight(scanCtx.BaseURL, "/")+op.Path, bodyReader)
+	if err != nil {
+		return nil
+	}
+	req.Header = headers
+
+	resp, err := scanCtx.Client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	ct := strings.ToLower(resp.Header.Get("content-type"))
+	status := resp.StatusCode
+	statusClass := status / 100
+
+	switch {
+	case statusClass == 2 || statusClass == 3:
+		return detector.NewFinding("A-201", "broken-auth").
+			WithSeverity("high").
+			WithEndpoint(op.Method, op.Path).
+			WithEvidence("status", status).
+			WithReason("secured endpoint responded success without Authorization").
+			WithRemedy("Enforce auth middleware; return 401/403 to unauthenticated requests.").
+			BuildSlice()
+	case status == 401 || status == 403:
+		// Expected denial - no finding
+		return nil
+
+	case status == 404:
+		// Hidden route - no finding
+		return nil
+
+	case status == 400 || status == 415:
+		// Validation before auth (inconclusive) - no finding
+		return nil
+
+	case status >= 500:
+		return detector.NewFinding("A-202", "broken-auth").
+			WithSeverity("medium").
+			WithEndpoint(op.Method, op.Path).
+			WithEvidence("status", status).
+			WithReason("server error when accessing secured endpoint without token").
+			WithRemedy("Handle unauthenticated access gracefully; avoid server crashes.").
+			BuildSlice()
+	case statusClass == 3 && strings.Contains(ct, "text/html") &&
+		strings.Contains(strings.ToLower(string(snippet)), "<html"):
+		// HTML redirect to login page
+		return detector.NewFinding("A-203", "broken-auth").
+			WithSeverity("low").
+			WithEndpoint(op.Method, op.Path).
+			WithEvidence("status", status).
+			WithEvidence("content-type", ct).
+			WithEvidence("body-snippet", string(snippet)).
+			WithReason("redirected to HTML login page instead of API-style JSON 401/403").
+			WithRemedy("Return JSON 401/403 errors for APIs instead of HTML login pages.").
+			BuildSlice()
+	default:
+		return nil
 	}
 }
 
@@ -64,85 +139,6 @@ func pickExample(m map[string][]byte) (string, []byte) {
 		}
 	}
 	return "", nil
-}
-
-func tryNoToken(ctx context.Context, sc Context, op openapi.Operation, body []byte, contentType string) []report.Finding {
-	out := []report.Finding{}
-
-	// Build request WITHOUT Authorization.
-	h := sc.Headers.Clone()
-	h.Del("Authorization")
-	if contentType != "" {
-		h.Set("Content-Type", contentType)
-	}
-
-	req, _ := http.NewRequestWithContext(ctx, op.Method, strings.TrimRight(sc.BaseURL, "/")+op.Path, bytesOrNil(body))
-	req.Header = h
-
-	resp, err := sc.Client.Do(req)
-	if err != nil {
-		return out // connectivity is handled elsewhere
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	ct := strings.ToLower(resp.Header.Get("content-type"))
-	status := resp.StatusCode
-	cls := status / 100
-
-	// Decision table
-	switch {
-	case cls == 2 || cls == 3:
-		out = append(out, report.Finding{
-			ID:       "A-201",
-			Severity: "high",
-			Category: "broken-auth",
-			Endpoint: op.Path,
-			Method:   strings.ToUpper(op.Method),
-			Evidence: map[string]any{
-				"status": status,
-				"reason": "secured endpoint responded success without Authorization",
-			},
-			Remedy: "Enforce auth middleware; return 401/403 to unauthenticated requests.",
-		})
-	case status == 401 || status == 403:
-		// Expected denial -> no finding
-	case status == 404:
-		// Hidden route -> no finding
-	case status == 400 || status == 415:
-		// Likely validation before auth (inconclusive) -> no finding
-	case status >= 500:
-		out = append(out, report.Finding{
-			ID:       "A-202",
-			Severity: "medium",
-			Category: "broken-auth",
-			Endpoint: op.Path,
-			Method:   strings.ToUpper(op.Method),
-			Evidence: map[string]any{
-				"status": status,
-				"reason": "server error when accessing secured endpoint without token",
-			},
-			Remedy: "Handle unauthenticated access gracefully; avoid server crashes.",
-		})
-		// Optional heuristic: APIs returning HTML redirects for login in 3xx
-	case cls == 3 && strings.Contains(ct, "text/html") && strings.Contains(strings.ToLower(string(snippet)), "<html"):
-		out = append(out, report.Finding{
-			ID:       "A-203",
-			Severity: "low",
-			Category: "broken-auth",
-			Endpoint: op.Path,
-			Method:   strings.ToUpper(op.Method),
-			Evidence: map[string]any{
-				"status":       status,
-				"content-type": ct,
-				"body-snippet": string(snippet),
-				"reason":       "redirected to HTML login page instead of API-style JSON 401/403",
-			},
-			Remedy: "Return JSON 401/403 errors for APIs instead of HTML login pages.",
-		})
-	}
-
-	return out
 }
 
 func bytesOrNil(b []byte) io.Reader {
