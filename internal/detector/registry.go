@@ -62,7 +62,7 @@ func (r *Registry) RunAll(ctx context.Context, scanCtx *Context, op openapi.Oper
 	r.mu.RLock()
 	detectors := make([]Detector, len(r.detectors))
 	copy(detectors, r.detectors)
-	r.mu.Unlock()
+	r.mu.RUnlock()
 
 	var findings []report.Finding
 
