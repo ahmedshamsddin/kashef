@@ -14,6 +14,8 @@ import (
 	"github.com/ahmedshamsddin/kashef/internal/openapi"
 	"github.com/ahmedshamsddin/kashef/internal/report"
 	ssrf "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api7_ssrf"
+	securitymisconfig "github.com/ahmedshamsddin/kashef/internal/scan/detectors/api8_security_misconfig"
+	"github.com/ahmedshamsddin/kashef/internal/scan/detectors/connectivity"
 )
 
 // RunOpenAPIScan orchestrates the complete security scan of an OpenAPI specification
@@ -171,54 +173,7 @@ func (s *scanner) scanOperation(ctx context.Context, op openapi.Operation) []rep
 
 // checkConnectivity performs initial connectivity check against the base URL
 func (s *scanner) checkConnectivity() []report.Finding {
-	req, err := http.NewRequest(http.MethodHead, s.spec.Server, nil)
-	if err != nil {
-		return []report.Finding{
-			{
-				ID:       "A-0002",
-				Severity: "high",
-				Category: "connectivity",
-				Evidence: map[string]interface{}{"error": err.Error()},
-				Remedy:   "Ensure the target server is accessible and the URL is correct.",
-			},
-		}
-	}
-
-	req.Header = s.headers.Clone()
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return []report.Finding{
-			{
-				ID:       "A-0002",
-				Severity: "high",
-				Category: "connectivity",
-				Evidence: map[string]interface{}{"error": err.Error()},
-				Remedy:   "Check network connectivity and DNS resolution.",
-			},
-		}
-	}
-	defer closeBody(resp)
-
-	findings := []report.Finding{
-		{
-			ID:       "A-0000",
-			Severity: "info",
-			Category: "connectivity",
-			Evidence: map[string]interface{}{"status": resp.StatusCode},
-		},
-	}
-
-	if resp.StatusCode >= 500 {
-		findings = append(findings, report.Finding{
-			ID:       "A-0001",
-			Severity: "medium",
-			Category: "runtime",
-			Evidence: map[string]interface{}{"status": resp.StatusCode},
-			Remedy:   "Server is experiencing errors. Check server logs and health.",
-		})
-	}
-
-	return findings
+	return connectivity.CheckConnectivity(s.client, s.spec.Server, s.headers)
 }
 
 // checkGlobalSecurity performs global security checks (CORS, headers)
@@ -236,78 +191,12 @@ func (s *scanner) checkGlobalSecurity() []report.Finding {
 
 // checkCORS checks for CORS misconfigurations
 func (s *scanner) checkCORS() []report.Finding {
-	req, _ := http.NewRequest(http.MethodOptions, s.spec.Server, nil)
-	req.Header = s.headers.Clone()
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer closeBody(resp)
-
-	acao := resp.Header.Get("Access-Control-Allow-Origin")
-	acc := strings.ToLower(resp.Header.Get("Access-Control-Allow-Credentials"))
-
-	if acao == "*" && acc == "true" {
-		return []report.Finding{
-			{
-				ID:       "A-020",
-				Severity: "high",
-				Category: "cors",
-				Evidence: map[string]interface{}{
-					"allow-origin":      acao,
-					"allow-credentials": acc,
-				},
-				Remedy: "Do not use wildcard origin (*) with credentials=true. Specify exact allowed origins.",
-			},
-		}
-	}
-
-	return nil
+	return securitymisconfig.CheckCORS(s.client, s.spec.Server, s.headers)
 }
 
 // checkSecurityHeaders checks for missing security headers
 func (s *scanner) checkSecurityHeaders() []report.Finding {
-	req, _ := http.NewRequest(http.MethodOptions, s.spec.Server, nil)
-	req.Header = s.headers.Clone()
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer closeBody(resp)
-
-	requiredHeaders := []string{
-		"strict-transport-security",
-		"x-frame-options",
-		"x-content-type-options",
-	}
-
-	present := make(map[string]bool)
-	for k := range resp.Header {
-		present[strings.ToLower(k)] = true
-	}
-
-	var missing []string
-	for _, header := range requiredHeaders {
-		if !present[header] {
-			missing = append(missing, header)
-		}
-	}
-
-	if len(missing) > 0 {
-		return []report.Finding{
-			{
-				ID:       "A-023",
-				Severity: "medium",
-				Category: "headers",
-				Evidence: map[string]interface{}{"missing": missing},
-				Remedy:   "Add standard security headers: Strict-Transport-Security, X-Frame-Options, X-Content-Type-Options.",
-			},
-		}
-	}
-
-	return nil
+	return securitymisconfig.CheckSecurityHeaders(s.client, s.spec.Server, s.headers)
 }
 
 // writeReport generates and writes the scan report
@@ -358,12 +247,6 @@ func parseHeaders(headers []string) http.Header {
 	return h
 }
 
-func closeBody(resp *http.Response) {
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-}
-
 // Report writing functions
 
 func writeJSON(rep report.Report, outputPath string) error {
@@ -393,7 +276,9 @@ func writeMarkdown(rep report.Report, outputPath string) error {
 			continue
 		}
 
-		fmt.Fprintf(&b, "## %s Severity (%d)\n\n", strings.Title(severity), len(findings))
+		// Properly capitalize severity (strings.Title is deprecated)
+		severityTitle := strings.ToUpper(severity[:1]) + severity[1:]
+		fmt.Fprintf(&b, "## %s Severity (%d)\n\n", severityTitle, len(findings))
 
 		for _, f := range findings {
 			fmt.Fprintf(&b, "### %s - %s\n\n", f.ID, f.Category)
