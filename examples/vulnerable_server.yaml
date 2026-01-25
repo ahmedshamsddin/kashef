@@ -1,0 +1,68 @@
+openapi: 3.0.0
+info:
+  title: Vulnerable Test API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /v1/users:
+    get:
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: 
+                  type: string
+
+  /v1/admin:
+    get:
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+
+  /v1/fetch:
+    get:
+      parameters:
+        - name: url
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+
+  /v1/debug:
+    get:
+      responses:
+        '500':
+          description: Error
+
+  /v1/status:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                required:
+                  - status
+                additionalProperties: false
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
