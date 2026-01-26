@@ -28,6 +28,12 @@ var (
 	token       string
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "26/01/2026"
+)
+
 func main() {
 	root := &cobra.Command{
 		Use:   "kashef",
@@ -87,6 +93,7 @@ Examples:
 			}
 			return nil
 		},
+		Version: fmt.Sprintf("%s (commit: %s, date: %s)", version, commit, date),
 	}
 
 	openapiCmd.Flags().StringVarP(&out, "out", "o", "report.json", "Output file path (json|md by extension)")
